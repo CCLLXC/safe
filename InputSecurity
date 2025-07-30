@@ -1,0 +1,34 @@
+import re
+
+class InputSecurity:
+    def __init__(self):
+        # 定义攻击模式：SQL注入、系统命令、恶意脚本等
+        self.injection_patterns = [
+            r"(;|\|).*(ls|cat|rm|shutdown|kill)",  
+            r"<script.*?>.*?</script>",  
+            r"SELECT.*?FROM|INSERT INTO|DROP TABLE",  
+            r"\.\./|\./",  
+            r"eval\(|exec\(|system\("  
+        ]
+        self.threshold = 3
+        self.failed_attempts = {}  
+
+    def sanitize_input(self, user_input: str, user_id: str) -> str:
+        if self.failed_attempts.get(user_id, 0) >= self.threshold:
+            return "BLOCKED: Too many failed attempts"      
+        for pattern in self.injection_patterns:
+            if re.search(pattern, user_input, re.IGNORECASE):
+                self._log_attempt(user_id)
+                return "BLOCKED: Potential security threat detected"       
+        safe_input = re.sub(r"<[^>]+>", "", user_input)  
+        return safe_input
+
+    def _log_attempt(self, user_id: str):
+        self.failed_attempts[user_id] = self.failed_attempts.get(user_id, 0) + 1
+        print(f"SECURITY ALERT: User {user_id} - Potential attack attempt")
+
+# 示例
+security = InputSecurity()
+user_input = "你好; rm -rf /"
+clean_input = security.sanitize_input(user_input, "user123")
+print(clean_input)  # 输出: BLOCKED: Potential security threat detected
