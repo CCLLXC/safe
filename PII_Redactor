@@ -1,26 +1,149 @@
 import re
+import hashlib
+import logging
+from typing import Dict, List, Tuple, Optional, Set, Any
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime
+import json
 
-class PII_Redactor:
-    def __init__(self):
-        self.id_card_pattern = re.compile(r'\b[1-9]\d{5}(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b')
-        self.bank_card_pattern = re.compile(r'\b[1-9]\d{15,18}\b')
-        self.phone_pattern = re.compile(r'\b1[3-9]\d{9}\b')
-        self.email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
 
-    def redact_text(self, text: str) -> str:
-        text = self.id_card_pattern.sub('[ID CARD REDACTED]', text)
-        text = self.bank_card_pattern.sub('[BANK CARD REDACTED]', text)
-        text = self.phone_pattern.sub('[PHONE REDACTED]', text)
-        text = self.email_pattern.sub('[EMAIL REDACTED]', text)
-        return text
+class PIIType(Enum):
+    CHINA_ID_CARD = "china_id_card"
+    BANK_CARD = "bank_card"
+    PHONE_NUMBER = "phone_number"
+    EMAIL = "email"
+    NAME = "name"
+    ADDRESS = "address"
+    PASSPORT = "passport"
+    SOCIAL_SECURITY = "social_security"
+    CREDIT_CARD = "credit_card"
+    IP_ADDRESS = "ip_address"
+    DRIVER_LICENSE = "driver_license"
+    WECHAT_ID = "wechat_id"
+    QQ_NUMBER = "qq_number"
+    LICENSE_PLATE = "license_plate"
 
-    def detect_pii(self, text: str) -> bool:
-        return (bool(self.id_card_pattern.search(text)) or
-                bool(self.bank_card_pattern.search(text)) or
-                bool(self.phone_pattern.search(text)) or
-                bool(self.email_pattern.search(text)))
-# 示例
-redactor = PII_Redactor()
-text = "我的身份证是110105199001011234，电话是13800138000"
-safe_text = redactor.redact_text(text)
-print(safe_text)  # 输出: 我的身份证是[ID CARD REDACTED]，电话是[PHONE REDACTED]
+
+@dataclass
+class PIIMatch:
+    pii_type: PIIType
+    start_pos: int
+    end_pos: int
+    original_value: str
+    redacted_value: str
+    confidence: float = 1.0
+
+
+@dataclass
+class RedactionResult:
+    original_text: str
+    redacted_text: str
+    pii_found: List[PIIMatch] = field(default_factory=list)
+    pii_count: Dict[PIIType, int] = field(default_factory=dict)
+    has_pii: bool = False
+    processing_time_ms: float = 0.0
+
+
+class PIIRedactor:
+
+    def __init__(
+            self,
+            enable_logging: bool = True,
+            custom_redaction_text: Optional[Dict[PIIType, str]] = None,
+            hash_pii: bool = False,
+            preserve_partial: bool = False,
+            confidence_threshold: float = 0.8
+    ):
+
+        self.hash_pii = hash_pii
+        self.preserve_partial = preserve_partial
+        self.confidence_threshold = confidence_threshold
+        self.pii_hashes: Set[str] = set()
+
+        if enable_logging:
+            self.logger = logging.getLogger(__name__)
+            self.logger.setLevel(logging.INFO)
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                )
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+        else:
+            self.logger = None
+
+        self.patterns = self._initialize_patterns()
+
+        self.redaction_text = custom_redaction_text or self._default_redaction_text()
+
+        self.chinese_surnames = {
+            '王', '李', '张', '刘', '陈', '杨', '黄', '赵', '周', '吴', '杨', '梁', '徐', '潘', '盘', '关', '钱', '马',
+            '凤', '方', '柳',
+            '赵', '钱', '周', '郑', '冯', '褚', '卫', '蒋', '沈', '韩', '秦', '尤', '何', '吕', '施', '张', '孔', '曹',
+            '严', '华', '花', '俞', '袁',
+            '金', '魏', '陶', '姜', '戚', '喻', '柏', '水', '窦', '章', '云', '潘', '葛', '奚', '范', '彭', '郎', '鲁',
+            '韦', '昌', '苗', '任',
+            '徐', '孙', '马', '胡', '朱', '郭', '何', '罗', '高', '林', '崔', '邹', '谢', '康', '许', '苏', '吴'
+        }
+
+    def _initialize_patterns(self) -> Dict[PIIType, re.Pattern]:
+        return {
+            PIIType.CHINA_ID_CARD: re.compile(
+                r'\b[1-9]\d{5}(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b'
+            ),
+
+            PIIType.BANK_CARD: re.compile(
+                r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11}|\d{15,19})\b'
+            ),
+
+            PIIType.PHONE_NUMBER: re.compile(
+                r'\b(?:(?:\+|00)86[-\s]?)?1(?:3\d|4[5-9]|5[0-35-9]|6[2567]|7[0-8]|8\d|9[0-35-9])[-\s]?\d{4}[-\s]?\d{4}\b'
+            ),
+
+            PIIType.EMAIL: re.compile(
+                r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+            ),
+
+            PIIType.NAME: re.compile(
+                r'[\u4e00-\u9fa5]{2,4}(?:先生|女士|小姐|同学|老师|医生|护士|同志)?'
+            ),
+
+            PIIType.IP_ADDRESS: re.compile(
+                r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b|'
+                r'\b(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}\b'
+            ),
+
+            PIIType.PASSPORT: re.compile(
+                r'\b[EeGgDdSsPpHh]\d{8}\b'
+            ),
+
+            PIIType.CREDIT_CARD: re.compile(
+                r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12})\b'
+            ),
+
+            PIIType.WECHAT_ID: re.compile(
+                r'\b[a-zA-Z][a-zA-Z0-9_-]{5,19}\b'
+            ),
+
+            PIIType.QQ_NUMBER: re.compile(
+                r'\b[1-9][0-9]{4,11}\b'
+            ),
+
+            PIIType.LICENSE_PLATE: re.compile(
+                r'\b[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-Z][A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警港澳]\b'
+            )
+        }
+
+    def _default_redaction_text(self) -> Dict[PIIType, str]:
+        return {
+            PIIType.CHINA_ID_CARD: "[已隐藏]",
+            PIIType.BANK_CARD: "[已隐藏]",
+            PIIType.PHONE_NUMBER: "[已隐藏]",
+            PIIType.EMAIL: "[已隐藏]",
+            PIIType.NAME: "[已隐藏]",
+            PIIType.ADDRESS: "[已隐藏]",
+            PIIType.PASSPORT: "[已隐藏]",
+            PIIType.SOCIAL_SECURITY: "[已隐藏]",
+            PIIType.CRED
