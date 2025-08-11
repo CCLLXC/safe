@@ -146,4 +146,217 @@ class PIIRedactor:
             PIIType.ADDRESS: "[已隐藏]",
             PIIType.PASSPORT: "[已隐藏]",
             PIIType.SOCIAL_SECURITY: "[已隐藏]",
-            PIIType.CRED
+            PIIType.CREDIT_CARD: "[已隐藏]",
+            PIIType.IP_ADDRESS: "[已隐藏]",
+            PIIType.DRIVER_LICENSE: "[已隐藏]",
+            PIIType.WECHAT_ID: "[已隐藏]",
+            PIIType.QQ_NUMBER: "[已隐藏]",
+            PIIType.LICENSE_PLATE: "[已隐藏]"
+        }
+
+    def redact_text(self, text: str, pii_types: Optional[List[PIIType]] = None) -> RedactionResult:
+        start_time = datetime.now()
+
+        if not text:
+            return RedactionResult(
+                original_text=text,
+                redacted_text=text,
+                has_pii=False
+            )
+
+        types_to_check = pii_types or list(PIIType)
+
+        all_matches = []
+        pii_count = {}
+
+        for pii_type in types_to_check:
+            if pii_type not in self.patterns:
+                continue
+
+            pattern = self.patterns[pii_type]
+            matches = list(pattern.finditer(text))
+
+            for match in matches:
+                if pii_type == PIIType.CHINA_ID_CARD and not self._validate_china_id(match.group()):
+                    continue
+                if pii_type == PIIType.BANK_CARD and not self._validate_bank_card(match.group()):
+                    continue
+                if pii_type == PIIType.NAME and not self._validate_chinese_name(match.group()):
+                    continue
+
+                pii_match = PIIMatch(
+                    pii_type=pii_type,
+                    start_pos=match.start(),
+                    end_pos=match.end(),
+                    original_value=match.group(),
+                    redacted_value=self._get_redacted_value(pii_type, match.group())
+                )
+
+                all_matches.append(pii_match)
+                pii_count[pii_type] = pii_count.get(pii_type, 0) + 1
+
+                if self.hash_pii:
+                    self._hash_pii_value(pii_type, match.group())
+
+        all_matches.sort(key=lambda x: x.start_pos, reverse=True)
+        redacted_text = text
+        for match in all_matches:
+            redacted_text = (
+                    redacted_text[:match.start_pos] +
+                    match.redacted_value +
+                    redacted_text[match.end_pos:]
+            )
+
+        if all_matches and self.logger:
+            self.logger.info(
+                f"PII detected and redacted: {pii_count}"
+            )
+
+        processing_time = (datetime.now() - start_time).total_seconds() * 1000
+
+        return RedactionResult(
+            original_text=text,
+            redacted_text=redacted_text,
+            pii_found=all_matches,
+            pii_count=pii_count,
+            has_pii=bool(all_matches),
+            processing_time_ms=processing_time
+        )
+
+    def detect_pii(self, text: str, pii_types: Optional[List[PIIType]] = None) -> Dict[PIIType, List[str]]:
+
+        result = self.redact_text(text, pii_types)
+
+        pii_dict = {}
+        for match in result.pii_found:
+            if match.pii_type not in pii_dict:
+                pii_dict[match.pii_type] = []
+            pii_dict[match.pii_type].append(match.original_value)
+
+        return pii_dict
+
+    def _get_redacted_value(self, pii_type: PIIType, value: str) -> str:
+        if self.preserve_partial:
+            if pii_type == PIIType.PHONE_NUMBER and len(value) >= 11:
+                return f"{value[:3]}****{value[-4:]}"
+            elif pii_type == PIIType.EMAIL:
+                parts = value.split('@')
+                if len(parts) == 2 and len(parts[0]) > 2:
+                    return f"{parts[0][:2]}***@{parts[1]}"
+            elif pii_type == PIIType.BANK_CARD and len(value) >= 8:
+                return f"****{value[-4:]}"
+            elif pii_type == PIIType.CHINA_ID_CARD and len(value) >= 8:
+                return f"{value[:6]}********{value[-4:]}"
+
+        return self.redaction_text.get(pii_type, "[PII REDACTED]")
+
+    def _validate_china_id(self, id_number: str) -> bool:
+        if len(id_number) != 18:
+            return False
+
+        factors = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+        checksum_map = '10X98765432'
+
+        try:
+            total = sum(int(id_number[i]) * factors[i] for i in range(17))
+            expected_checksum = checksum_map[total % 11]
+            return id_number[-1].upper() == expected_checksum
+        except:
+            return False
+
+    def _validate_bank_card(self, card_number: str) -> bool:
+        try:
+            digits = [int(d) for d in card_number.replace(' ', '').replace('-', '')]
+            checksum = 0
+
+            for i, digit in enumerate(reversed(digits[:-1])):
+                if i % 2 == 0:
+                    doubled = digit * 2
+                    checksum += doubled if doubled < 10 else doubled - 9
+                else:
+                    checksum += digit
+
+            return (checksum + digits[-1]) % 10 == 0
+        except:
+            return False
+
+    def _validate_chinese_name(self, name: str) -> bool:
+        if len(name) >= 2 and name[0] in self.chinese_surnames:
+            return True
+
+        if any(name.endswith(suffix) for suffix in ['先生', '小姐', '同学', '老师']):
+            return True
+
+        return False
+
+    def _hash_pii_value(self, pii_type: PIIType, value: str):
+        hash_input = f"{pii_type.value}:{value}"
+        hash_value = hashlib.sha256(hash_input.encode()).hexdigest()
+        self.pii_hashes.add(hash_value)
+
+    def export_stats(self) -> Dict[str, Any]:
+        return {
+            "total_hashed_pii": len(self.pii_hashes),
+            "patterns_loaded": len(self.patterns),
+            "confidence_threshold": self.confidence_threshold,
+            "preserve_partial": self.preserve_partial
+        }
+
+    def add_custom_pattern(self, pii_type: PIIType, pattern: str, redaction_text: str):
+        self.patterns[pii_type] = re.compile(pattern)
+        self.redaction_text[pii_type] = redaction_text
+
+        if self.logger:
+            self.logger.info(f"Added custom pattern for {pii_type.value}")
+
+
+class PIIMiddleware:
+
+    def __init__(self, redactor: PIIRedactor):
+        self.redactor = redactor
+
+    def process_request(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned_data = {}
+
+        for key, value in request_data.items():
+            if isinstance(value, str):
+                result = self.redactor.redact_text(value)
+                cleaned_data[key] = result.redacted_text
+
+                if result.has_pii:
+                    pass
+            else:
+                cleaned_data[key] = value
+
+        return cleaned_data
+# 示例
+if __name__ == "__main__":
+    redactor = PIIRedactor(
+        enable_logging=True,
+        preserve_partial=True,
+        hash_pii=True
+    )
+
+    # Test text
+    test_text = """
+    用户信息：
+    姓名：张三
+    身份证：110101199003074514
+    手机：18675795109
+    邮箱：wander555@qq.com
+    银行卡：6222021234567890128
+    微信号：zhangsan_wx123
+    车牌号：京A12345
+    """
+
+    result = redactor.redact_text(test_text)
+
+    print("Original text:")
+    print(test_text)
+    print("\nRedacted text:")
+    print(result.redacted_text)
+    print(f"\nPII found: {result.pii_count}")
+    print(f"Processing time: {result.processing_time_ms:.2f}ms")
+
+    detected_pii = redactor.detect_pii(test_text)
+    print(f"\nDetected PII types: {list(detected_pii.keys())}")
