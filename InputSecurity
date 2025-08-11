@@ -1,34 +1,275 @@
 import re
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from enum import Enum
+
+
+class ThreatType(Enum):
+    COMMAND_INJECTION = "command_injection"
+    SQL_INJECTION = "sql_injection"
+    XSS_ATTACK = "xss_attack"
+    PATH_TRAVERSAL = "path_traversal"
+    CODE_EXECUTION = "code_execution"
+    LDAP_INJECTION = "ldap_injection"
+    XPATH_INJECTION = "xpath_injection"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ValidationResult:
+    is_safe: bool
+    sanitized_input: str
+    threat_type: Optional[ThreatType] = None
+    message: Optional[str] = None
+
 
 class InputSecurity:
-    def __init__(self):
-        # 定义攻击模式：SQL注入、系统命令、恶意脚本等
-        self.injection_patterns = [
-            r"(;|\|).*(ls|cat|rm|shutdown|kill)",  
-            r"<script.*?>.*?</script>",  
-            r"SELECT.*?FROM|INSERT INTO|DROP TABLE",  
-            r"\.\./|\./",  
-            r"eval\(|exec\(|system\("  
+
+    def __init__(
+            self,
+            max_attempts: int = 3,
+            block_duration_minutes: int = 30,
+            max_input_length: int = 10000,
+            enable_logging: bool = True
+    ):
+
+        self.max_attempts = max_attempts
+        self.block_duration = timedelta(minutes=block_duration_minutes)
+        self.max_input_length = max_input_length
+        self.failed_attempts: Dict[str, List[datetime]] = {}
+        self.blocked_users: Dict[str, datetime] = {}
+
+        if enable_logging:
+            self.logger = logging.getLogger(__name__)
+            self.logger.setLevel(logging.WARNING)
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                )
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+        else:
+            self.logger = None
+
+        self.threat_patterns = {
+            ThreatType.COMMAND_INJECTION: [
+                r"(;|\||&&|\$\(|\`).*(ls|cat|rm|dd|chmod|chown|kill|ps|netstat|ifconfig|uname|whoami|id|pwd|cd|mkdir|touch|echo|grep|find|wget|curl|bash|sh|python|perl|ruby|php)",
+                r"(shutdown|reboot|halt|poweroff|init\s+0)",
+                r"(/etc/passwd|/etc/shadow|/etc/hosts)",
+                r"(nc\s+-|ncat\s+-|netcat\s+-)",
+            ],
+            ThreatType.SQL_INJECTION: [
+                r"(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC|EXECUTE|UNION|ORDER BY|GROUP BY|HAVING|INTO OUTFILE|INTO DUMPFILE)\s+.*?(FROM|INTO|TABLE|DATABASE|WHERE)",
+                r"(--)|(#)|(/\*.*?\*/)",
+                r"(OR|AND)\s+\d+\s*=\s*\d+",
+                r"(CAST|CONVERT|CHAR|CONCAT|SUBSTRING|LENGTH)\s*\(",
+                r"(xp_cmdshell|sp_executesql|sp_makewebtask)",
+            ],
+            ThreatType.XSS_ATTACK: [
+                r"<script[^>]*>.*?</script>",
+                r"javascript\s*:",
+                r"on\w+\s*=",
+                r"<iframe[^>]*>.*?</iframe>",
+                r"<object[^>]*>.*?</object>",
+                r"<embed[^>]*>.*?</embed>",
+                r"<svg[^>]*>.*?</svg>",
+                r"<img[^>]*onerror\s*=",
+                r"<input[^>]*onfocus\s*=",
+            ],
+            ThreatType.PATH_TRAVERSAL: [
+                r"\.\.\/|\.\.\\",
+                r"(\.\/|\.\\){2,}",
+                r"%2e%2e[%2f%5c]",
+                r"\.\.[\\\/]",
+                r"(\/|\\)(etc|var|usr|tmp|proc|sys)(\/|\\)",
+            ],
+            ThreatType.CODE_EXECUTION: [
+                r"eval\s*\(",
+                    r"exec\s*\(",
+                r"system\s*\(",
+                r"passthru\s*\(",
+                r"shell_exec\s*\(",
+                r"assert\s*\(",
+                r"preg_replace.*\/e",
+                r"create_function\s*\(",
+                r"include(_once)?\s*\(",
+                r"require(_once)?\s*\(",
+                r"file_get_contents\s*\(",
+                r"fopen\s*\(",
+                r"readfile\s*\(",
+            ],
+            ThreatType.LDAP_INJECTION: [
+                r"\(\|\(",
+                r"\(\&\(",
+                r"\(\!\(",
+                r"[)(\*\|&=]",
+            ],
+            ThreatType.XPATH_INJECTION: [
+                r"(\/\/|\/\*|\[\d+\])",
+                r"(or|and)\s+\d+\s*=\s*\d+",
+                r"[\[\]\/\@\=\<\>\:\']",
+            ]
+        }
+
+        self.sanitization_rules = [
+            (r"<[^>]+>", ""),
+            (r"[^\w\s\-\.@,!?()]", ""),
+            (r"\s+", " "),
         ]
-        self.threshold = 3
-        self.failed_attempts = {}  
 
-    def sanitize_input(self, user_input: str, user_id: str) -> str:
-        if self.failed_attempts.get(user_id, 0) >= self.threshold:
-            return "BLOCKED: Too many failed attempts"      
-        for pattern in self.injection_patterns:
-            if re.search(pattern, user_input, re.IGNORECASE):
-                self._log_attempt(user_id)
-                return "BLOCKED: Potential security threat detected"       
-        safe_input = re.sub(r"<[^>]+>", "", user_input)  
-        return safe_input
+    def validate_input(self, user_input: str, user_id: str) -> ValidationResult:
+        if self._is_user_blocked(user_id):
+            return ValidationResult(
+                is_safe=False,
+                sanitized_input="",
+                threat_type=None,
+                message=f"User blocked until {self.blocked_users[user_id].strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
-    def _log_attempt(self, user_id: str):
-        self.failed_attempts[user_id] = self.failed_attempts.get(user_id, 0) + 1
-        print(f"SECURITY ALERT: User {user_id} - Potential attack attempt")
+        if len(user_input) > self.max_input_length:
+            return ValidationResult(
+                is_safe=False,
+                sanitized_input="",
+                threat_type=None,
+                message=f"Input exceeds maximum length of {self.max_input_length} characters"
+            )
 
-# 示例
-security = InputSecurity()
-user_input = "你好; rm -rf /"
-clean_input = security.sanitize_input(user_input, "user123")
-print(clean_input)  # 输出: BLOCKED: Potential security threat detected
+        if not user_input or not user_input.strip():
+            return ValidationResult(
+                is_safe=True,
+                sanitized_input="",
+                threat_type=None,
+                message="Empty input"
+            )
+
+        threat_detected, threat_type = self._detect_threats(user_input)
+
+        if threat_detected:
+            self._log_security_event(user_id, user_input, threat_type)
+            self._record_failed_attempt(user_id)
+
+            if self._should_block_user(user_id):
+                self._block_user(user_id)
+                return ValidationResult(
+                    is_safe=False,
+                    sanitized_input="",
+                    threat_type=threat_type,
+                    message=f"Security threat detected: {threat_type.value}. User has been blocked."
+                )
+
+            return ValidationResult(
+                is_safe=False,
+                sanitized_input="",
+                threat_type=threat_type,
+                message=f"Security threat detected: {threat_type.value}"
+            )
+
+        sanitized = self._sanitize_input(user_input)
+
+        return ValidationResult(
+            is_safe=True,
+            sanitized_input=sanitized,
+            threat_type=None,
+            message="Input validated successfully"
+        )
+
+    def _detect_threats(self, user_input: str) -> Tuple[bool, Optional[ThreatType]]:
+        for threat_type, patterns in self.threat_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, user_input, re.IGNORECASE):
+                    return True, threat_type
+        return False, None
+
+    def _sanitize_input(self, user_input: str) -> str:
+        sanitized = user_input
+        for pattern, replacement in self.sanitization_rules:
+            sanitized = re.sub(pattern, replacement, sanitized)
+        return sanitized.strip()
+
+    def _is_user_blocked(self, user_id: str) -> bool:
+        if user_id in self.blocked_users:
+            if datetime.now() < self.blocked_users[user_id]:
+                return True
+            else:
+                del self.blocked_users[user_id]
+                if user_id in self.failed_attempts:
+                    del self.failed_attempts[user_id]
+        return False
+
+    def _record_failed_attempt(self, user_id: str):
+        now = datetime.now()
+        if user_id not in self.failed_attempts:
+            self.failed_attempts[user_id] = []
+
+        # Remove old attempts
+        self.failed_attempts[user_id] = [
+            attempt for attempt in self.failed_attempts[user_id]
+            if now - attempt < self.block_duration
+        ]
+
+        self.failed_attempts[user_id].append(now)
+
+    def _should_block_user(self, user_id: str) -> bool:
+        return len(self.failed_attempts.get(user_id, [])) >= self.max_attempts
+
+    def _block_user(self, user_id: str):
+        self.blocked_users[user_id] = datetime.now() + self.block_duration
+
+    def _log_security_event(self, user_id: str, user_input: str, threat_type: ThreatType):
+        if self.logger:
+            safe_input_preview = user_input[:100] + "..." if len(user_input) > 100 else user_input
+            safe_input_preview = safe_input_preview.replace('\n', '\\n').replace('\r', '\\r')
+
+            self.logger.warning(
+                f"SECURITY ALERT - User: {user_id}, "
+                f"Threat: {threat_type.value}, "
+                f"Input preview: {safe_input_preview}"
+            )
+
+    def get_user_status(self, user_id: str) -> Dict[str, any]:
+        return {
+            "is_blocked": self._is_user_blocked(user_id),
+            "failed_attempts": len(self.failed_attempts.get(user_id, [])),
+            "block_expires": self.blocked_users.get(user_id),
+            "max_attempts": self.max_attempts
+        }
+
+    def reset_user(self, user_id: str):
+        if user_id in self.failed_attempts:
+            del self.failed_attempts[user_id]
+        if user_id in self.blocked_users:
+            del self.blocked_users[user_id]
+
+
+if __name__ == "__main__":
+    security = InputSecurity(
+        max_attempts=3,
+        block_duration_minutes=30,
+        max_input_length=1000,
+        enable_logging=True
+    )
+
+    test_cases = [
+        ("user123", "Hello, this is a normal input"),
+        ("user123", "你好; rm -rf /"),
+        ("user456", "<script>alert('XSS')</script>"),
+        ("user789", "SELECT * FROM users WHERE id = 1 OR 1=1"),
+        ("user101", "../../etc/passwd"),
+        ("user102", "eval(malicious_code)"),
+    ]
+
+    print("Security Validation Results:")
+    print("-" * 60)
+
+    for user_id, user_input in test_cases:
+        result = security.validate_input(user_input, user_id)
+        print(f"User: {user_id}")
+        print(f"Input: {user_input[:50]}...")
+        print(f"Safe: {result.is_safe}")
+        print(f"Message: {result.message}")
+        if result.is_safe:
+            print(f"Sanitized: {result.sanitized_input}")
+        print("-" * 60)
